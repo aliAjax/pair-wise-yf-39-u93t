@@ -5,30 +5,282 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>野生动物疫病监测与离线同步</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
-    main { max-width: 820px; margin: auto; }
-    pre { background: #f3f4f6; padding: 1rem; border-radius: 8px; overflow-x: auto; }
-    button { padding: .5rem .8rem; cursor: pointer; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; background: #f9fafb; }
+    main { max-width: 980px; margin: auto; }
+    section { background: #fff; border: 1px solid #e5e7eb; border-radius: 10px; padding: 1.2rem; margin-bottom: 1.5rem; }
+    h1 { font-size: 1.4rem; }
+    h2 { font-size: 1.1rem; margin-top: 0; }
+    table { border-collapse: collapse; width: 100%; font-size: .9rem; }
+    th, td { border: 1px solid #e5e7eb; padding: .35rem .5rem; text-align: left; }
+    th { background: #f3f4f6; }
+    button { padding: .35rem .7rem; cursor: pointer; border-radius: 6px; border: 1px solid #9ca3af; background: #fff; }
+    button.primary { background: #2563eb; color: #fff; border-color: #2563eb; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .tag { display: inline-block; padding: .1rem .5rem; border-radius: 999px; font-size: .75rem; }
+    .tag.pos { background: #fee2e2; color: #b91c1c; }
+    .tag.neg { background: #dcfce7; color: #166534; }
+    .tag.ctrl { background: #e0e7ff; color: #3730a3; }
+    .tag.pending { background: #fef3c7; color: #92400e; }
+    .tag.confirmed { background: #d1fae5; color: #065f46; }
+    .blocker { color: #b91c1c; font-size: .85rem; }
+    .muted { color: #6b7280; font-size: .85rem; }
+    #message { white-space: pre-wrap; background: #1f2937; color: #f9fafb; padding: .8rem; border-radius: 8px; font-size: .85rem; min-height: 1.2rem; }
+    label { font-size: .85rem; margin-right: .8rem; }
+    input, select { padding: .3rem; }
+    .wellgrid td.missing { background: #fff7ed; }
+    .flex { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; }
   </style>
 </head>
 <body>
 <main>
-  <h1>野生动物疫病监测与离线同步</h1>
-  <p>这是最小演示页面。使用浏览器或 curl 调用 JSON API。</p>
-  <p><button onclick="checkHealth()">检查服务状态</button></p>
-  <pre id="result">等待操作</pre>
-  <h2>常用接口</h2>
-  <pre>GET  /health
-GET  /api/&lt;kind&gt;
-POST /api/&lt;kind&gt;
-GET  /api/entities/&lt;id&gt;
-POST /api/entities/&lt;id&gt;/actions</pre>
+  <h1>野生动物疫病监测 · 实验室检测板</h1>
+  <p class="muted">从已送检样本排样到检测板；板号重复、样本同时在两块未完成板上会被拦住。整板结果齐全且对照有效后才能确认。</p>
+
+  <section class="flex">
+    <label>操作角色
+      <select id="role">
+        <option value="lab">lab（实验室）</option>
+        <option value="admin">admin</option>
+        <option value="field">field</option>
+        <option value="viewer">viewer</option>
+      </select>
+    </label>
+    <button onclick="checkHealth()">检查服务状态</button>
+    <button onclick="loadAll()">刷新</button>
+  </section>
+
+  <section>
+    <h2>新建检测板</h2>
+    <div class="flex">
+      <label>板号 <input id="plateCode" placeholder="如 P-2026-001"></label>
+      <button onclick="addControlWell()">添加对照孔</button>
+      <button onclick="addSampleWell()">添加样本孔</button>
+      <button class="primary" onclick="createPlate()">创建检测板</button>
+    </div>
+    <p class="muted">对照孔单独标注阴/阳性；样本只能从“已送检（in_lab）”的样本中选择。样本不能重复放在同一块板或两块未完成板上。</p>
+    <table id="wellEditor">
+      <thead><tr><th>孔位</th><th>类型</th><th>对照标注 / 样本</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <section>
+    <h2>检测板</h2>
+    <div id="plates"></div>
+  </section>
+
+  <section>
+    <h2>已送检 / 已出结果样本</h2>
+    <table>
+      <thead><tr><th>样本编号</th><th>状态</th><th>结果</th><th>检测板号</th><th>孔位</th></tr></thead>
+      <tbody id="samples"></tbody>
+    </table>
+  </section>
+
+  <pre id="message">等待操作</pre>
 </main>
 <script>
-async function checkHealth() {
-  const response = await fetch('/health');
-  document.getElementById('result').textContent = JSON.stringify(await response.json(), null, 2);
+const BLOCKER_TEXT = {
+  missing_results: '有孔位缺失结果',
+  missing_controls: '缺少对照孔',
+  invalid_controls: '对照孔结果与标注不符',
+};
+let samples = [];
+let editorWells = [];
+
+function headers(extra) {
+  return Object.assign({
+    'Content-Type': 'application/json',
+    'X-User-Id': 'web-user',
+    'X-Role': document.getElementById('role').value,
+  }, extra || {});
 }
+
+async function api(path, options) {
+  const response = await fetch(path, options);
+  const payload = await response.json();
+  if (!response.ok) {
+    throw new Error((payload.type || 'Error') + ': ' + payload.error);
+  }
+  return payload;
+}
+
+function show(text, ok) {
+  const el = document.getElementById('message');
+  el.textContent = text;
+  el.style.color = ok === false ? '#fca5a5' : '#86efac';
+}
+
+async function checkHealth() {
+  show(JSON.stringify(await api('/health'), null, 2));
+}
+
+async function loadAll() {
+  samples = (await api('/api/samples')).items;
+  renderSamples();
+  renderWellEditor();
+  const plates = (await api('/api/plates')).items;
+  document.getElementById('plates').innerHTML = plates.map(renderPlate).join('')
+    || '<p class="muted">暂无检测板</p>';
+}
+
+function renderSamples() {
+  const rows = samples
+    .filter(s => ['in_lab', 'resulted', 'closed'].includes(s.status))
+    .map(s => `<tr>
+      <td>${s.data.sample_code || ''}</td>
+      <td><span class="tag pending">${s.status}</span></td>
+      <td>${s.data.result ? '<span class="tag ' + (s.data.result === 'positive' ? 'pos' : 'neg') + '">' + s.data.result + '</span>' : ''}</td>
+      <td>${s.data.plate_code || ''}</td>
+      <td>${s.data.well || ''}</td>
+    </tr>`);
+  document.getElementById('samples').innerHTML = rows.join('')
+    || '<tr><td colspan="5" class="muted">暂无已送检样本（先创建观察、提交、采样并 send_lab）</td></tr>';
+}
+
+function inLabOptions() {
+  return samples.filter(s => s.status === 'in_lab')
+    .map(s => `<option value="${s.id}">${s.data.sample_code}（${s.id.slice(0, 8)}）</option>`).join('');
+}
+
+function addControlWell() {
+  editorWells.push({ well: nextWell(), type: 'control', control: 'negative' });
+  renderWellEditor();
+}
+
+function addSampleWell() {
+  const first = samples.find(s => s.status === 'in_lab');
+  editorWells.push({ well: nextWell(), type: 'sample', sample_id: first ? first.id : '' });
+  renderWellEditor();
+}
+
+function nextWell() {
+  const row = String.fromCharCode(65 + Math.floor(editorWells.length / 12));
+  return row + ((editorWells.length % 12) + 1);
+}
+
+function renderWellEditor() {
+  const body = document.querySelector('#wellEditor tbody');
+  body.innerHTML = editorWells.map((w, i) => {
+    const target = w.type === 'control'
+      ? `<select onchange="editorWells[${i}].control=this.value">
+           <option value="negative"${w.control === 'negative' ? ' selected' : ''}>阴性对照</option>
+           <option value="positive"${w.control === 'positive' ? ' selected' : ''}>阳性对照</option>
+         </select>`
+      : `<select onchange="editorWells[${i}].sample_id=this.value">${inLabOptions()
+            .replace(`value="${w.sample_id}"`, `value="${w.sample_id}" selected`)}</select>`;
+    return `<tr>
+      <td><input value="${w.well}" style="width:5rem" onchange="editorWells[${i}].well=this.value"></td>
+      <td><select onchange="changeWellType(${i}, this.value)">
+            <option value="sample"${w.type === 'sample' ? ' selected' : ''}>样本</option>
+            <option value="control"${w.type === 'control' ? ' selected' : ''}>对照</option>
+          </select></td>
+      <td>${target}</td>
+      <td><button onclick="editorWells.splice(${i},1);renderWellEditor()">移除</button></td>
+    </tr>`;
+  }).join('');
+}
+
+function changeWellType(i, type) {
+  editorWells[i] = { well: editorWells[i].well, type,
+    ...(type === 'control' ? { control: 'negative' } : { sample_id: '' }) };
+  renderWellEditor();
+}
+
+async function createPlate() {
+  const plate_code = document.getElementById('plateCode').value.trim();
+  const wells = editorWells.map(w => w.type === 'control'
+    ? { well: w.well, type: 'control', control: w.control }
+    : { well: w.well, type: 'sample', sample_id: w.sample_id });
+  try {
+    await api('/api/plates', {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ plate_code, wells }),
+    });
+    show('检测板 ' + plate_code + ' 已创建（未完成）', true);
+    editorWells = [];
+    document.getElementById('plateCode').value = '';
+    await loadAll();
+  } catch (err) {
+    show(err.message, false);
+  }
+}
+
+function renderPlate(plate) {
+  const s = plate.data.summary;
+  const blockers = (s.blockers || []).map(b => `<li class="blocker">${BLOCKER_TEXT[b] || b}${
+    b === 'missing_results' ? '：' + s.missing.join('、') : ''}</li>`).join('');
+  const rows = plate.data.wells.map(w => {
+    const sample = w.type === 'sample'
+      ? (samples.find(x => x.id === w.sample_id) || {})
+      : null;
+    const sampleCode = sample.data ? sample.data.sample_code : w.sample_id || '';
+    const resultCell = plate.status === 'pending'
+      ? `<select onchange="setWellResult('${plate.id}','${w.well}',this.value)">
+           <option value="">未录入</option>
+           <option value="positive"${w.result === 'positive' ? ' selected' : ''}>阳性</option>
+           <option value="negative"${w.result === 'negative' ? ' selected' : ''}>阴性</option>
+         </select>`
+      : (w.result || '—');
+    return `<tr class="wellgrid ${!w.result ? 'missing' : ''}">
+      <td>${w.well}</td>
+      <td>${w.type === 'control'
+        ? '<span class="tag ctrl">' + (w.control === 'positive' ? '阳性对照' : '阴性对照') + '</span>'
+        : '样本'}</td>
+      <td>${sampleCode}</td>
+      <td>${resultCell}</td>
+    </tr>`;
+  }).join('');
+  const confirmButton = plate.status === 'pending'
+    ? `<button class="primary" ${s.ready ? '' : 'disabled title="' + (s.blockers || []).map(b => BLOCKER_TEXT[b]).join('；') + '"'}
+         onclick="confirmPlate('${plate.id}')">确认整板结果</button>
+       <span class="muted">确认后阳性转入已出结果、阴性关闭，并写回板号</span>`
+    : '<span class="tag confirmed">已确认</span><span class="muted"> 重复确认沿用第一次结果</span>';
+  return `<div style="margin-bottom:1.2rem">
+    <h3>${plate.data.plate_code}
+      <span class="tag ${plate.status === 'pending' ? 'pending' : 'confirmed'}">${plate.status}</span>
+      <span class="muted">已录入 ${s.resulted_count}/${s.well_count}</span>
+    </h3>
+    ${blockers ? '<ul>' + blockers + '</ul>' : (plate.status === 'pending' ? '<p class="muted">结果齐全、对照有效，可以确认。</p>' : '')}
+    <table>
+      <thead><tr><th>孔位</th><th>类型/对照标注</th><th>样本</th><th>结果</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <p style="margin-top:.6rem">${confirmButton}</p>
+  </div>`;
+}
+
+async function setWellResult(plateId, well, result) {
+  if (!result) return;
+  try {
+    await api(`/api/entities/${plateId}/actions`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ action: 'set_well_result', data: { well, result } }),
+    });
+    await loadAll();
+  } catch (err) {
+    show(err.message, false);
+  }
+}
+
+async function confirmPlate(plateId) {
+  const result_at = new Date().toISOString().slice(0, 10);
+  try {
+    await api(`/api/entities/${plateId}/actions`, {
+      method: 'POST',
+      headers: headers(),
+      body: JSON.stringify({ action: 'confirm', data: { result_at } }),
+    });
+    show('整板已确认：阳性样本转入“已出结果”，阴性样本已关闭，检测板号已写回。', true);
+    await loadAll();
+  } catch (err) {
+    show(err.message, false);
+  }
+}
+
+loadAll().catch(err => show(err.message, false));
 </script>
 </body>
 </html>

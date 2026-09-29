@@ -24,7 +24,29 @@ python3 app.py --db ./data.db --port 8305
 
 ## 核心对象
 
-- `observation`：现场观察；`sample`：样本与实验室结果；`cluster`：异常聚集事件。
+- `observation`：现场观察；`sample`：样本与实验室结果；`cluster`：异常聚集事件；`plate`：实验室检测板。
+
+## 检测板流程
+
+检测板（`plate`）解决复测时同一位置容易放错、阳性无法落到具体观察的问题：
+
+1. 由 `lab`/`admin` 从**已送检（`in_lab`）**样本排样创建检测板（状态 `pending`）。每个孔位形如 `A1`；对照孔用 `type:"control"` 单独标注 `control:"positive"|"negative"`，样本孔为 `type:"sample"` 并携带 `sample_id`。
+2. 创建时拦截：板号 `plate_code` 重复、孔位重复、同板内同一样本重复排样、样本已在另一块**未完成（pending）**板上、样本未送检。
+3. 通过 `set_well_result` 逐孔录入 `positive`/`negative`。
+4. `confirm` 仅在整板结果齐全、至少一个对照孔且所有对照孔结果与标注一致时通过；页面与 `data.summary` 提供孔位、缺失结果（`missing`）和阻塞原因（`blockers`：`missing_results`/`missing_controls`/`invalid_controls`）。
+5. 确认后级联处理：**阳性**样本转入 `resulted` 并写回 `plate_code`/`plate_id`/`well`（随后可 `retest` 复测，复测排上新板）；**阴性**样本自动 `close`。
+6. 对已确认的板再次 `confirm` 为幂等操作，原样返回、沿用第一次结果，不产生新版本或审计。
+
+创建请求示例：
+
+```json
+POST /api/plates
+{"plate_code": "P-001", "wells": [
+  {"well": "A1", "type": "control", "control": "negative"},
+  {"well": "A2", "type": "sample", "sample_id": "<sample-id>"},
+  {"well": "B1", "type": "control", "control": "positive"}
+]}
+```
 
 ## 主要接口
 
